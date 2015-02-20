@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import re
 import geocoder
 import json
+from operator import itemgetter
 
 INSPECTION_DOMAIN = 'http://info.kingcounty.gov'
 INSPECTION_PATH = '/health/ehs/foodsafety/inspections/Results.aspx'
@@ -24,6 +25,13 @@ INSPECTION_PARAMS = {
     'Violation_Descr': '',
     'Fuzzy_Search': 'N',
     'Sort': 'H'
+}
+
+SORT_TYPES = {
+    'highscore': u'High Score',
+    'averagescore': u'Average Score',
+    'mostinspections': u'Total Inspections',
+    'name': u"Business Name"
 }
 
 
@@ -124,7 +132,7 @@ def extract_score_data(elem):
     return data
 
 
-def generate_results(test, count=10):
+def generate_results(test, count=10, sort=None, reverse=True):
     kwargs = {
         'Inspection_Start': '2/1/2013',
         'Inspection_End': '2/1/2015',
@@ -134,13 +142,33 @@ def generate_results(test, count=10):
         html, encoding = load_inspection_page()
     else:
         html, encoding = get_inspection_page(**kwargs)
+
     doc = parse_source(html, encoding)
     listings = extract_data_listings(doc)
-    for listing in listings[:count]:
-        metadata = extract_restaurant_metadata(listing)
-        score_data = extract_score_data(listing)
-        metadata.update(score_data)
-        yield metadata
+
+    if sort:
+        listings = order_listings(listings, sort, count, reverse)
+        for listing in listings:
+            yield listing
+    else:
+        for listing in listings[:count]:
+            yield apply_score_data(listing)
+
+
+def apply_score_data(data):
+    metadata = extract_restaurant_metadata(data)
+    score_data = extract_score_data(data)
+    metadata.update(score_data)
+    return metadata
+
+
+def order_listings(listings, sort, count, reverse=True):
+    sort_list = []
+    sort_by = SORT_TYPES[sort]
+    for listing in listings:
+        sort_list.append(apply_score_data(listing))
+    sorted_list = sorted(sort_list, key=itemgetter(sort_by), reverse=(not reverse))
+    return sorted_list[:count]
 
 
 def get_geojson(result):
@@ -169,19 +197,24 @@ def get_geojson(result):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--highscore", type=int, 
-        help="prints restaurant with highest score")
-    args = parser.parse_args()
-    if args.highscore:
-        pass
+    import pprint
 
-    # import pprint
-    # test = len(sys.argv) > 1 and sys.argv[1] == 'test'
-    # total_result = {'type': 'FeatureCollection', 'features': []}
-    # for result in generate_results(test):
-    #     geo_result = get_geojson(result)
-    #     pprint.pprint(geo_result)
-    #     total_result['features'].append(geo_result)
-    # with open('my_map.json', 'w') as fh:
-    #     json.dump(total_result, fh)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("sort", type=str,
+                        help="prints restaurants sorted")
+    parser.add_argument("number", type=int,
+                        help="number of items to display")
+    parser.add_argument("-t", "--test", type=bool,
+                        help="takes data from cached html")
+    parser.add_argument("-r", "--reverse", action='store_true',
+                        help="what order do you want results displayed")
+    args = parser.parse_args()
+
+    total_result = {'type': 'FeatureCollection', 'features': []}
+
+    for result in generate_results(args.test, count=args.number, sort=args.sort, reverse=args.reverse):
+        geo_result = get_geojson(result)
+        pprint.pprint(geo_result)
+        total_result['features'].append(geo_result)
+    with open('my_map.json', 'w') as fh:
+        json.dump(total_result, fh)
