@@ -1,0 +1,220 @@
+import requests
+import sys
+from bs4 import BeautifulSoup
+import re
+import geocoder
+import json
+from operator import itemgetter
+
+INSPECTION_DOMAIN = 'http://info.kingcounty.gov'
+INSPECTION_PATH = '/health/ehs/foodsafety/inspections/Results.aspx'
+INSPECTION_PARAMS = {
+    'Output': 'W',
+    'Business_Name': '',
+    'Business_Address': '',
+    'Longitude': '',
+    'Latitude': '',
+    'City': '',
+    'Zip_Code': '',
+    'Inspection_Type': 'All',
+    'Inspection_Start': '',
+    'Inspection_End': '',
+    'Inspection_Closed_Business': 'A',
+    'Violation_Points': '',
+    'Violation_Red_Points': '',
+    'Violation_Descr': '',
+    'Fuzzy_Search': 'N',
+    'Sort': 'H'
+}
+
+SORT_TYPES = {
+    'highscore': u'High Score',
+    'averagescore': u'Average Score',
+    'mostinspections': u'Total Inspections',
+    'name': u"Business Name"
+}
+
+
+def get_inspection_page(**kwargs):
+    url = INSPECTION_DOMAIN + INSPECTION_PATH
+    params = INSPECTION_PARAMS.copy()
+    for key, val in kwargs.items():
+        if key in INSPECTION_PARAMS:
+            params[key] = val
+    resp = requests.get(url, params=params)
+    resp.raise_for_status()  # <- This is a no-op if there is no HTTP error
+    # remember, in requests `content` is bytes and `text` is unicode
+
+    with open('inspection_page.html', 'w') as outfile:
+        outfile.write(resp.encoding + "\n" + resp.content)
+
+    return resp.content, resp.encoding
+
+
+def load_inspection_page():
+    with open('inspection_page.html', 'r') as infile:
+        code = infile.readline()
+        html = infile.read()
+    return html, code
+
+
+def parse_source(html, encoding='utf-8'):
+    parsed = BeautifulSoup(html, from_encoding=encoding)
+    return parsed
+
+
+def extract_data_listings(html):
+    id_finder = re.compile(r'PR[\d]+~')
+    return html.find_all('div', id=id_finder)
+
+
+def has_two_tds(elem):
+    is_tr = elem.name == 'tr'
+    td_children = elem.find_all('td', recursive=False)
+    has_two = len(td_children) == 2
+    return is_tr and has_two
+
+
+def clean_data(td):
+    data = td.string
+    try:
+        return data.strip(" \n:-")
+    except AttributeError:
+        return u""
+
+
+def extract_restaurant_metadata(elem):
+    metadata_rows = elem.find('tbody').find_all(
+        has_two_tds, recursive=False
+    )
+    rdata = {}
+    current_label = ''
+    for row in metadata_rows:
+        key_cell, val_cell = row.find_all('td', recursive=False)
+        new_label = clean_data(key_cell)
+        current_label = new_label if new_label else current_label
+        rdata.setdefault(current_label, []).append(clean_data(val_cell))
+    return rdata
+
+
+def is_inspection_row(elem):
+    is_tr = elem.name == 'tr'
+    if not is_tr:
+        return False
+    td_children = elem.find_all('td', recursive=False)
+    has_four = len(td_children) == 4
+    this_text = clean_data(td_children[0]).lower()
+    contains_word = 'inspection' in this_text
+    does_not_start = not this_text.startswith('inspection')
+    return is_tr and has_four and contains_word and does_not_start
+
+
+def extract_score_data(elem):
+    inspection_rows = elem.find_all(is_inspection_row)
+    samples = len(inspection_rows)
+    total = high_score = average = 0
+    for row in inspection_rows:
+        strval = clean_data(row.find_all('td')[2])
+        try:
+            intval = int(strval)
+        except (ValueError, TypeError):
+            samples -= 1
+        else:
+            total += intval
+            high_score = intval if intval > high_score else high_score
+    if samples:
+        average = total/float(samples)
+    data = {
+        u'Average Score': average,
+        u'High Score': high_score,
+        u'Total Inspections': samples
+    }
+    return data
+
+
+def generate_results(test, count=10, sort=None, reverse=True):
+    kwargs = {
+        'Inspection_Start': '2/1/2013',
+        'Inspection_End': '2/1/2015',
+        'Zip_Code': '98109'
+    }
+    if test:
+        html, encoding = load_inspection_page()
+    else:
+        html, encoding = get_inspection_page(**kwargs)
+
+    doc = parse_source(html, encoding)
+    listings = extract_data_listings(doc)
+
+    if sort:
+        listings = order_listings(listings, sort, count, reverse)
+        for listing in listings:
+            yield listing
+    else:
+        for listing in listings[:count]:
+            yield apply_score_data(listing)
+
+
+def apply_score_data(data):
+    metadata = extract_restaurant_metadata(data)
+    score_data = extract_score_data(data)
+    metadata.update(score_data)
+    return metadata
+
+
+def order_listings(listings, sort, count, reverse=True):
+    sort_list = []
+    sort_by = SORT_TYPES[sort]
+    for listing in listings:
+        sort_list.append(apply_score_data(listing))
+    sorted_list = sorted(sort_list, key=itemgetter(sort_by), reverse=(not reverse))
+    return sorted_list[:count]
+
+
+def get_geojson(result):
+    address = " ".join(result.get('Address', ''))
+    if not address:
+        return None
+    geocoded = geocoder.google(address)
+    geojson = geocoded.geojson
+    inspection_data = {}
+    use_keys = (
+        'Business Name', 'Average Score', 'Total Inspections', 'High Score',
+        'Address',
+    )
+    for key, val in result.items():
+        if key not in use_keys:
+            continue
+        if isinstance(val, list):
+            val = " ".join(val)
+        inspection_data[key] = val
+    new_address = geojson['properties'].get('address')
+    if new_address:
+        inspection_data['Address'] = new_address
+    geojson['properties'] = inspection_data
+    return geojson
+
+
+if __name__ == '__main__':
+    import argparse
+    import pprint
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("sort", type=str,
+                        help="prints restaurants sorted")
+    parser.add_argument("number", type=int,
+                        help="number of items to display")
+    parser.add_argument("-t", "--test", type=bool,
+                        help="takes data from cached html")
+    parser.add_argument("-r", "--reverse", action='store_true',
+                        help="what order do you want results displayed")
+    args = parser.parse_args()
+
+    total_result = {'type': 'FeatureCollection', 'features': []}
+
+    for result in generate_results(args.test, count=args.number, sort=args.sort, reverse=args.reverse):
+        geo_result = get_geojson(result)
+        pprint.pprint(geo_result)
+        total_result['features'].append(geo_result)
+    with open('my_map.json', 'w') as fh:
+        json.dump(total_result, fh)
